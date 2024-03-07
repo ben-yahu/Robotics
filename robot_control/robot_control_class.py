@@ -1,76 +1,53 @@
 #!/usr/bin/env python
 
 import rospy
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, Point, Quaternion
 from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+import tf
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
 import time
+from math import radians, copysign, sqrt, pow, pi
+import PyKDL
 
 
 class RobotControl():
 
-    def __init__(self, robot_name="turtlebot"):
+    def __init__(self):
         rospy.init_node('robot_control_node', anonymous=True)
-
-        if robot_name == "summit":
-            rospy.loginfo("Robot Summit...")
-            cmd_vel_topic = "/summit_xl_control/cmd_vel"
-            # We check that sensors are working
-            self._check_summit_laser_ready()
-        else:      
-            rospy.loginfo("Robot Turtlebot...")      
-            cmd_vel_topic='/cmd_vel'
-            self._check_laser_ready()
-
-        # We start the publisher
-        self.vel_publisher = rospy.Publisher(cmd_vel_topic, Twist, queue_size=1)
-        self.cmd = Twist()        
-
+        self.vel_publisher = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+        self.summit_vel_publisher = rospy.Publisher('/summit_xl_control/cmd_vel', Twist, queue_size=1)
         self.laser_subscriber = rospy.Subscriber(
             '/kobuki/laser/scan', LaserScan, self.laser_callback)
         self.summit_laser_subscriber = rospy.Subscriber(
             '/hokuyo_base/scan', LaserScan, self.summit_laser_callback)
-        
+        self.odom_sub = rospy.Subscriber ('/odom', Odometry, self.odom_callback)
+        self.cmd = Twist()
+        self.laser_msg = LaserScan()
+        self.summit_laser_msg = LaserScan()
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.yaw = 0.0
         self.ctrl_c = False
-        self.rate = rospy.Rate(1)
+        self.rate = rospy.Rate(10)
+        self.tf_listener = tf.TransformListener()
+        self.odom_frame = '/odom'
+        self.base_frame = '/base_link'
+        self.angular_tolerance = radians(2)
         rospy.on_shutdown(self.shutdownhook)
-
-    
-    def _check_summit_laser_ready(self):
-        self.summit_laser_msg = None
-        rospy.loginfo("Checking Summit Laser...")
-        while self.summit_laser_msg is None and not rospy.is_shutdown():
-            try:
-                self.summit_laser_msg = rospy.wait_for_message("/hokuyo_base/scan", LaserScan, timeout=1.0)
-                rospy.logdebug("Current /hokuyo_base/scan READY=>" + str(self.summit_laser_msg))
-
-            except:
-                rospy.logerr("Current /hokuyo_base/scan not ready yet, retrying for getting scan")
-        rospy.loginfo("Checking Summit Laser...DONE")
-        return self.summit_laser_msg
-
-    def _check_laser_ready(self):
-        self.laser_msg = None
-        rospy.loginfo("Checking Laser...")
-        while self.laser_msg is None and not rospy.is_shutdown():
-            try:
-                self.laser_msg = rospy.wait_for_message("/kobuki/laser/scan", LaserScan, timeout=1.0)
-                rospy.logdebug("Current /kobuki/laser/scan READY=>" + str(self.laser_msg))
-
-            except:
-                rospy.logerr("Current /kobuki/laser/scan not ready yet, retrying for getting scan")
-        rospy.loginfo("Checking Laser...DONE")
-        return self.laser_msg
 
     def publish_once_in_cmd_vel(self):
         """
         This is because publishing in topics sometimes fails the first time you publish.
-        In continuous publishing systems, this is no big deal, but in systems that publish only
-        once, it IS very important.
+        In continuous publishing systems there is no big deal but in systems that publish only
+        once it IS very important.
         """
         while not self.ctrl_c:
             connections = self.vel_publisher.get_num_connections()
-            if connections > 0:
+            summit_connections = self.summit_vel_publisher.get_num_connections()
+            if connections > 0 or summit_connections > 0:
                 self.vel_publisher.publish(self.cmd)
+                self.summit_vel_publisher.publish(self.cmd)
                 #rospy.loginfo("Cmd Published")
                 break
             else:
@@ -85,6 +62,11 @@ class RobotControl():
 
     def summit_laser_callback(self, msg):
         self.summit_laser_msg = msg
+
+    def odom_callback(self, msg):
+        orientation_q = msg.pose.pose.orientation
+        orientation_list = [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+        (self.roll, self.pitch, self.yaw) = euler_from_quaternion (orientation_list)
 
     def get_laser(self, pos):
         time.sleep(1)
@@ -141,13 +123,14 @@ class RobotControl():
 
             # Publish the velocity
             self.vel_publisher.publish(self.cmd)
-            i += 1
+            self.summit_vel_publisher.publish(self.cmd)
+            i += 0.1
             self.rate.sleep()
 
         # set velocity to zero to stop the robot
         self.stop_robot()
 
-        s = "Moved robot " + motion + " for " + str(time) + " seconds at " + str(speed) + "  m/s"
+        s = "Moved robot " + motion + " for " + str(time) + " seconds"
         return s
 
 
@@ -167,22 +150,93 @@ class RobotControl():
 
         i = 0
         # loop to publish the velocity estimate, current_distance = velocity * (t1 - t0)
+        
         while (i <= time):
 
             # Publish the velocity
             self.vel_publisher.publish(self.cmd)
-            i += 1
+            self.summit_vel_publisher.publish(self.cmd)
+            i += 0.1
             self.rate.sleep()
 
         # set velocity to zero to stop the robot
         self.stop_robot()
 
-        s = "Turned robot " + clockwise + " for " + str(time) + " seconds at " + str(speed) + "  radians/second"
+        s = "Turned robot " + clockwise + " for " + str(time) + " seconds"
         return s
+
+    def get_odom(self):
+
+        # Get the current transform between the odom and base frames
+        tf_ok = 0
+        while tf_ok == 0 and not rospy.is_shutdown():
+            try:
+                self.tf_listener.waitForTransform('/base_link', '/odom', rospy.Time(), rospy.Duration(1.0))
+                tf_ok = 1
+            except (tf.Exception, tf.ConnectivityException, tf.LookupException):
+                pass
+
+        try:
+            (trans, rot)  = self.tf_listener.lookupTransform('odom', 'base_link', rospy.Time(0))
+        except (tf.Exception, tf.ConnectivityException, tf.LookupException):
+            rospy.loginfo("TF Exception")
+            return
+
+        return (Point(*trans), self.quat_to_angle(Quaternion(*rot)))
+
+    def rotate(self, degrees):
+
+        position = Point()
+
+        # Get the current position
+        (position, rotation) = self.get_odom()
+
+        # Set the movement command to a rotation
+        if degrees > 0:
+            self.cmd.angular.z = 0.3
+        else:
+            self.cmd.angular.z = -0.3
+
+        # Track the last angle measured
+        last_angle = rotation
+        
+        # Track how far we have turned
+        turn_angle = 0
+
+        goal_angle = radians(degrees)
+
+        # Begin the rotation
+        while abs(turn_angle + self.angular_tolerance) < abs(goal_angle) and not rospy.is_shutdown():
+            # Publish the Twist message and sleep 1 cycle         
+            self.vel_publisher.publish(self.cmd) 
+            self.rate.sleep()
+            
+            # Get the current rotation.
+            (position, rotation) = self.get_odom()
+            
+            # Compute the amount of rotation since the last lopp
+            delta_angle = self.normalize_angle(rotation - last_angle)
+            
+            turn_angle += delta_angle
+            last_angle = rotation
+        
+        self.stop_robot()
+
+    def quat_to_angle(self, quat):
+        rot = PyKDL.Rotation.Quaternion(quat.x, quat.y, quat.z, quat.w)
+        return rot.GetRPY()[2]
+        
+    def normalize_angle(self, angle):
+        res = angle
+        while res > pi:
+            res -= 2.0 * pi
+        while res < -pi:
+            res += 2.0 * pi
+        return res
 
 
 if __name__ == '__main__':
-    
+    #rospy.init_node('robot_control_node', anonymous=True)
     robotcontrol_object = RobotControl()
     try:
         robotcontrol_object.move_straight()
